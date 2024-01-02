@@ -91,6 +91,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 
 	endpointslicemetrics.RegisterMetrics()
 
+	// 初始化Controller,并加入100个令牌，10qps的令牌桶限流队列
 	c := &Controller{
 		client: client,
 		// This is similar to the DefaultControllerRateLimiter, just with a
@@ -108,6 +109,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 		workerLoopPeriod: time.Second,
 	}
 
+	// 监听 `Service` 资源增删改事件
 	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.onServiceUpdate,
 		UpdateFunc: func(old, cur interface{}) {
@@ -118,6 +120,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 	c.serviceLister = serviceInformer.Lister()
 	c.servicesSynced = serviceInformer.Informer().HasSynced
 
+	// 监听`Pod` 资源增删改事件
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addPod,
 		UpdateFunc: c.updatePod,
@@ -130,6 +133,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 	c.nodesSynced = nodeInformer.Informer().HasSynced
 
 	logger := klog.FromContext(ctx)
+	// 监听`EndpointSlice` 资源增删改事件
 	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.onEndpointSliceAdd,
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -142,8 +146,10 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
 	c.endpointSliceTracker = endpointsliceutil.NewEndpointSliceTracker()
 
+	// 每个`EndpointSlice`最大支持`Endpoint` 数量,默认100
 	c.maxEndpointsPerSlice = maxEndpointsPerSlice
 
+	// 计算 service 和 pods 最后一次更新时间，并存到缓存,然后更新2者资源状态。
 	c.triggerTimeTracker = endpointsliceutil.NewTriggerTimeTracker()
 
 	c.eventBroadcaster = broadcaster
@@ -151,6 +157,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 
 	c.endpointUpdatesBatchPeriod = endpointUpdatesBatchPeriod
 
+	// 判断是否启用`TopologyAwareHints` 特性，如果启用监听`Node` 资源增删改事件
 	if utilfeature.DefaultFeatureGate.Enabled(features.TopologyAwareHints) {
 		nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
@@ -167,6 +174,7 @@ func NewController(ctx context.Context, podInformer coreinformers.PodInformer,
 		c.topologyCache = topologycache.NewTopologyCache()
 	}
 
+	// `EndpointSlice` 控制器核心逻辑
 	c.reconciler = endpointslicerec.NewReconciler(
 		c.client,
 		c.nodeLister,
@@ -268,6 +276,7 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 		return
 	}
 
+	// 启动 消费者 `worker` 协程
 	logger.V(2).Info("Starting worker threads", "total", workers)
 	for i := 0; i < workers; i++ {
 		go wait.Until(func() { c.worker(logger) }, c.workerLoopPeriod, ctx.Done())
@@ -292,6 +301,7 @@ func (c *Controller) processNextWorkItem(logger klog.Logger) bool {
 	}
 	defer c.queue.Done(cKey)
 
+	//
 	err := c.syncService(logger, cKey.(string))
 	c.handleErr(logger, err, cKey)
 
@@ -328,6 +338,7 @@ func (c *Controller) syncService(logger klog.Logger, key string) error {
 		return err
 	}
 
+	// 1. 获取 `Services` 对象
 	service, err := c.serviceLister.Services(namespace).Get(name)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -355,6 +366,7 @@ func (c *Controller) syncService(logger klog.Logger, key string) error {
 
 	logger.V(5).Info("About to update endpoint slices for service", "key", key)
 
+	// 2. 根据Service标签选择器获取 `Pods` 对象
 	podLabelSelector := labels.Set(service.Spec.Selector).AsSelectorPreValidated()
 	pods, err := c.podLister.Pods(service.Namespace).List(podLabelSelector)
 	if err != nil {
@@ -365,6 +377,7 @@ func (c *Controller) syncService(logger klog.Logger, key string) error {
 		return err
 	}
 
+	// 根据Service标签选择器获取 `EndpointSlices` 对象
 	esLabelSelector := labels.Set(map[string]string{
 		discovery.LabelServiceName: service.Name,
 		discovery.LabelManagedBy:   c.reconciler.GetControllerName(),
@@ -380,6 +393,7 @@ func (c *Controller) syncService(logger klog.Logger, key string) error {
 	}
 
 	// Drop EndpointSlices that have been marked for deletion to prevent the controller from getting stuck.
+	// 标记删除的 `EndpointSlices` 对象
 	endpointSlices = dropEndpointSlicesPendingDeletion(endpointSlices)
 
 	if c.endpointSliceTracker.StaleSlices(service, endpointSlices) {
@@ -389,9 +403,11 @@ func (c *Controller) syncService(logger klog.Logger, key string) error {
 	// We call ComputeEndpointLastChangeTriggerTime here to make sure that the
 	// state of the trigger time tracker gets updated even if the sync turns out
 	// to be no-op and we don't update the EndpointSlice objects.
+	// 计算 `EndpointSlices` 对象最后一次更新时间,并更新 `EndpointSlice` 的注解
 	lastChangeTriggerTime := c.triggerTimeTracker.
 		ComputeEndpointLastChangeTriggerTime(namespace, service, pods)
 
+	// 核心控制逻辑
 	err = c.reconciler.Reconcile(logger, service, pods, endpointSlices, lastChangeTriggerTime)
 	if err != nil {
 		c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateEndpointSlices",

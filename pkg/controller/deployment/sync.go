@@ -51,6 +51,7 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 	if err != nil {
 		return err
 	}
+	// `Scale` 扩缩容
 	if err := dc.scale(ctx, d, newRS, oldRSs); err != nil {
 		// If we get an error while trying to scale, the deployment will be requeued
 		// so we can abort this resync
@@ -65,6 +66,7 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 	}
 
 	allRSs := append(oldRSs, newRS)
+	// 更新状态
 	return dc.syncDeploymentStatus(ctx, allRSs, newRS, d)
 }
 
@@ -299,6 +301,8 @@ func (dc *DeploymentController) getNewReplicaSet(ctx context.Context, d *apps.De
 func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Deployment, newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet) error {
 	// If there is only one active replica set then we should scale that up to the full count of the
 	// deployment. If there is no active replica set, then we should scale up the newest replica set.
+	//返回唯一的活动或最新副本集（如果最多有一个活动副本集）
+	//副本集。如果有更多的活动副本集，那么我们应该按比例缩放它们。
 	if activeOrLatest := deploymentutil.FindActiveOrLatest(newRS, oldRSs); activeOrLatest != nil {
 		if *(activeOrLatest.Spec.Replicas) == *(deployment.Spec.Replicas) {
 			return nil
@@ -309,6 +313,10 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 
 	// If the new replica set is saturated, old replica sets should be fully scaled down.
 	// This case handles replica set adoption during a saturated new replica set.
+	//通过将新副本集的大小与其部署大小进行比较来检查新副本集是否饱和。
+	//部署和副本集都必须相信该副本集可以拥有所有所需的`Replicas`,
+	// 可以通过注解"deployment.kubernetes.io/desired-replicas"来实现。
+	//ReplicaSet 的所有 pod需要可用。
 	if deploymentutil.IsSaturated(deployment, newRS) {
 		for _, old := range controller.FilterActiveReplicaSets(oldRSs) {
 			if _, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, old, 0, deployment); err != nil {
@@ -321,18 +329,22 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 	// There are old replica sets with pods and the new replica set is not saturated.
 	// We need to proportionally scale all replica sets (new and old) in case of a
 	// rolling deployment.
+	// 如果 `Deployment` 有配置滚动更新策略, 那么就需要按照策略去对 `rs` 进行扩缩容
 	if deploymentutil.IsRollingUpdate(deployment) {
 		allRSs := controller.FilterActiveReplicaSets(append(oldRSs, newRS))
 		allRSsReplicas := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
 
+		// 计算最大可以创建出的 pod 数
 		allowedSize := int32(0)
 		if *(deployment.Spec.Replicas) > 0 {
+			// 预期的副本数加上 maxSurge 为最大允许数
 			allowedSize = *(deployment.Spec.Replicas) + deploymentutil.MaxSurge(*deployment)
 		}
 
 		// Number of additional replicas that can be either added or removed from the total
 		// replicas count. These replicas should be distributed proportionally to the active
 		// replica sets.
+		// 计算需要扩容的 pod 数
 		deploymentReplicasToAdd := allowedSize - allRSsReplicas
 
 		// The additional replicas should be distributed proportionally amongst the active
@@ -343,11 +355,15 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 		var scalingOperation string
 		switch {
 		case deploymentReplicasToAdd > 0:
+			// 若需要添加的副本数大于 0, 按照新旧进行排序，把新的 rs 放到前面, 这样对较新的 rs 扩容更多的 pod
 			sort.Sort(controller.ReplicaSetsBySizeNewer(allRSs))
+			// 扩容操作
 			scalingOperation = "up"
 
 		case deploymentReplicasToAdd < 0:
+			// 若需要添加的副本数大于 0, 按照新旧进行排序，旧的`RS`放前面, 这样可以删除一些较旧的 pod
 			sort.Sort(controller.ReplicaSetsBySizeOlder(allRSs))
+			// 缩容操作
 			scalingOperation = "down"
 		}
 
@@ -357,14 +373,17 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 		deploymentReplicasAdded := int32(0)
 		nameToSize := make(map[string]int32)
 		logger := klog.FromContext(ctx)
+		// 遍历所有的 rs, 计算每个 rs 需要扩容或者缩容到的期望副本数
 		for i := range allRSs {
 			rs := allRSs[i]
 
 			// Estimate proportions if we have replicas to add, otherwise simply populate
 			// nameToSize with the current sizes for each replica set.
 			if deploymentReplicasToAdd != 0 {
+				// 估算出 rs 需要扩容或者缩容的副本数
 				proportion := deploymentutil.GetProportion(logger, rs, *deployment, deploymentReplicasToAdd, deploymentReplicasAdded)
 
+				// 把计算出来的 `proportion` 累加到 `added`
 				nameToSize[rs.Name] = *(rs.Spec.Replicas) + proportion
 				deploymentReplicasAdded += proportion
 			} else {
@@ -373,6 +392,8 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 		}
 
 		// Update all replica sets
+		// 遍历所有的 rs, 第一个最活跃的 rs.Spec.Replicas 加上上面循环中计算出
+		// 其他 rs 要加或者减的副本数，然后更新所有 rs 的 rs.Spec.Replicas
 		for i := range allRSs {
 			rs := allRSs[i]
 
@@ -386,6 +407,7 @@ func (dc *DeploymentController) scale(ctx context.Context, deployment *apps.Depl
 			}
 
 			// TODO: Use transactions when we have them.
+			// 按照扩容的数量去进行扩缩容
 			if _, _, err := dc.scaleReplicaSet(ctx, rs, nameToSize[rs.Name], deployment, scalingOperation); err != nil {
 				// Return as soon as we fail, the deployment is requeued
 				return err
@@ -435,6 +457,10 @@ func (dc *DeploymentController) scaleReplicaSet(ctx context.Context, rs *apps.Re
 // cleanupDeployment is responsible for cleaning up a deployment ie. retains all but the latest N old replica sets
 // where N=d.Spec.RevisionHistoryLimit. Old replica sets are older versions of the podtemplate of a deployment kept
 // around by default 1) for historical reasons and 2) for the ability to rollback a deployment.
+// cleanupDeployment 负责清理部署，即保留除最新的 N 个旧副本集之外的所有副本集，其中 N=d.Spec.RevisionHistoryLimit。
+// 旧副本集是默认保留的部署 pod 模板的旧版本，
+// 1. 出于历史原因，
+// 2. 是为了能够回滚部署。
 func (dc *DeploymentController) cleanupDeployment(ctx context.Context, oldRSs []*apps.ReplicaSet, deployment *apps.Deployment) error {
 	logger := klog.FromContext(ctx)
 	if !deploymentutil.HasRevisionHistoryLimit(deployment) {
@@ -530,6 +556,7 @@ func calculateStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployme
 //
 // rsList should come from getReplicaSetsForDeployment(d).
 func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) (bool, error) {
+	// 获取新旧所有 `RS` 对象
 	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, false)
 	if err != nil {
 		return false, err
@@ -541,6 +568,7 @@ func (dc *DeploymentController) isScalingEvent(ctx context.Context, d *apps.Depl
 		if !ok {
 			continue
 		}
+		// 如果不是 `Replicas` 结构，则需要扩锁容
 		if desired != *(d.Spec.Replicas) {
 			return true, nil
 		}

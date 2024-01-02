@@ -72,15 +72,18 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 	slicesByAddressType := make(map[discovery.AddressType][]*discovery.EndpointSlice) // slices by address type
 
 	// addresses that this service supports [o(1) find]
+	// 获取`Service` 支持的地址类型
 	serviceSupportedAddressesTypes := getAddressTypesForService(logger, service)
 
 	// loop through slices identifying their address type.
 	// slices that no longer match address type supported by services
 	// go to delete, other slices goes to the Reconciler machinery
 	// for further adjustment
+	// 根据服务支持的地址类型,对`EndpointSlice`进行分类
 	for _, existingSlice := range existingSlices {
 		// service no longer supports that address type, add it to deleted slices
 		if !serviceSupportedAddressesTypes.Has(existingSlice.AddressType) {
+			// 拓扑缓存不为空,按拓扑进行切分
 			if r.topologyCache != nil {
 				svcKey, err := ServiceControllerKey(existingSlice)
 				if err != nil {
@@ -103,6 +106,7 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 	}
 
 	// reconcile for existing.
+	// 根据地址类型,对`EndpointSlice`进行切分处理
 	for addressType := range serviceSupportedAddressesTypes {
 		existingSlices := slicesByAddressType[addressType]
 		err := r.reconcileByAddressType(logger, service, pods, existingSlices, triggerTime, addressType)
@@ -113,6 +117,7 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 
 	// delete those which are of addressType that is no longer supported
 	// by the service
+	// 删除不再支持的`EndpointSlice`
 	for _, sliceToDelete := range slicesToDelete {
 		err := r.client.DiscoveryV1().EndpointSlices(service.Namespace).Delete(context.TODO(), sliceToDelete.Name, metav1.DeleteOptions{})
 		if err != nil {
@@ -130,6 +135,9 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 // compares them with the endpoints already present in any existing endpoint
 // slices (by address type) for the given service. It creates, updates, or deletes endpoint slices
 // to ensure the desired set of pods are represented by endpoint slices.
+// reconcileByAddressType 获取当前与服务选择器匹配的一组 Pod，
+// 并将它们与给定服务的任何现有端点切片（按地址类型）中已存在的端点进行比较。
+// 它创建、更新或删除端点切片，以确保所需的 pod 集由端点切片表示。
 func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.Service, pods []*corev1.Pod, existingSlices []*discovery.EndpointSlice, triggerTime time.Time, addressType discovery.AddressType) error {
 	errs := []error{}
 

@@ -18,6 +18,7 @@ package deployment
 
 import (
 	"context"
+
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +37,7 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 	activeOldRSs := controller.FilterActiveReplicaSets(oldRSs)
 
 	// scale down old replica sets.
+	// 缩容 oldRS
 	scaledDown, err := dc.scaleDownOldReplicaSetsForRecreate(ctx, activeOldRSs, d)
 	if err != nil {
 		return err
@@ -51,6 +53,7 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 	}
 
 	// If we need to create a new RS, create it now.
+	// 创建 `newRS`
 	if newRS == nil {
 		newRS, oldRSs, err = dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
 		if err != nil {
@@ -60,10 +63,12 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 	}
 
 	// scale up new replica set.
+	// 扩容`newRS`
 	if _, err := dc.scaleUpNewReplicaSetForRecreate(ctx, newRS, d); err != nil {
 		return err
 	}
 
+	// 清理过期的`RS`
 	if util.DeploymentComplete(d, &d.Status) {
 		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
 			return err
@@ -71,6 +76,7 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 	}
 
 	// Sync deployment status.
+	// 同步`Deployment`状态
 	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 }
 

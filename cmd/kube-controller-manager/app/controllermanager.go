@@ -102,6 +102,7 @@ const (
 
 // NewControllerManagerCommand creates a *cobra.Command object with default parameters
 func NewControllerManagerCommand() *cobra.Command {
+	// 初始化controllerManager的参数,例如ServiceControllerOptions、DaemonSetControllerOptions等
 	s, err := options.NewKubeControllerManagerOptions()
 	if err != nil {
 		klog.Background().Error(err, "Unable to initialize command options")
@@ -135,12 +136,14 @@ controller, and serviceaccounts controller.`,
 			}
 			cliflag.PrintFlags(cmd.Flags())
 
+			// 获取所有控制器配置,默认禁用的控制器
 			c, err := s.Config(KnownControllers(), ControllersDisabledByDefault(), ControllerAliases())
 			if err != nil {
 				return err
 			}
 			// add feature enablement metrics
 			utilfeature.DefaultMutableFeatureGate.AddMetrics()
+			// 启动控制器
 			return Run(context.Background(), c.Complete())
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -179,7 +182,18 @@ func ResyncPeriod(c *config.CompletedConfig) func() time.Duration {
 }
 
 // Run runs the KubeControllerManagerOptions.
+// 这段代码负责启动和管理kube-controller-manager的控制器，并处理健康检查和Leader选举。
+// 1. 设置日志记录器和停止通道。
+// 2. 启动事件处理管道。
+// 3. 设置健康检查。
+// 4. 启动控制器管理器的HTTP服务器。
+// 5. 创建客户端构建器。
+// 6. 创建服务账号令牌控制器描述符。
+// 7. 定义一个 `run` 函数，用于运行控制器。
+// 8. 如果不需要`leader` 选举，则直接运行控制器。
+// 9. 如果需要 `leader` 选举，则进行选举，并在获得领导地位后运行控制器。
 func Run(ctx context.Context, c *config.CompletedConfig) error {
+	// 1. 设置日志记录器和停止通道
 	logger := klog.FromContext(ctx)
 	stopCh := ctx.Done()
 
@@ -189,6 +203,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	logger.Info("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 
 	// Start events processing pipeline.
+	// 2. 启动事件处理进程
 	c.EventBroadcaster.StartStructuredLogging(0)
 	c.EventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.Client.CoreV1().Events("")})
 	defer c.EventBroadcaster.Shutdown()
@@ -200,6 +215,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	}
 
 	// Setup any healthz checks we will want to use.
+	// 3. 设置健康检测
 	var checks []healthz.HealthChecker
 	var electionChecker *leaderelection.HealthzAdaptor
 	if c.ComponentConfig.Generic.LeaderElection.LeaderElect {
@@ -210,6 +226,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 
 	// Start the controller manager HTTP server
 	// unsecuredMux is the handler for these controller *after* authn/authz filters have been applied
+	// 4. 启动控制器管理器的HTTP服务器。
 	var unsecuredMux *mux.PathRecorderMux
 	if c.SecureServing != nil {
 		unsecuredMux = genericcontrollermanager.NewBaseHandler(&c.ComponentConfig.Generic.Debugging, healthzHandler)
@@ -222,17 +239,22 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		}
 	}
 
+	// 5. 创建客户端构建器
 	clientBuilder, rootClientBuilder := createClientBuilders(logger, c)
 
+	// 6. 创建服务账号令牌控制器描述符。
 	saTokenControllerDescriptor := newServiceAccountTokenControllerDescriptor(rootClientBuilder)
 
+	// 7. 定义 `run` 函数
 	run := func(ctx context.Context, controllerDescriptors map[string]*ControllerDescriptor) {
+		// 7.1 创建controller的context
 		controllerContext, err := CreateControllerContext(logger, c, rootClientBuilder, clientBuilder, ctx.Done())
 		if err != nil {
 			logger.Error(err, "Error building controller context")
 			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 		}
 
+		// 7.2 启动各个控制器
 		if err := StartControllers(ctx, controllerContext, controllerDescriptors, unsecuredMux, healthzHandler); err != nil {
 			logger.Error(err, "Error starting controllers")
 			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
@@ -246,6 +268,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	}
 
 	// No leader election, run directly
+	// 8. 如果不需要leader选举，则直接运行控制器。
 	if !c.ComponentConfig.Generic.LeaderElection.LeaderElect {
 		controllerDescriptors := NewControllerDescriptors()
 		controllerDescriptors[names.ServiceAccountTokenController] = saTokenControllerDescriptor
@@ -259,12 +282,14 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	}
 
 	// add a uniquifier so that two processes on the same host don't accidentally both become active
+	// 添加唯一标识符，以便同一主机上的两个进程不会意外同时激活
 	id = id + "_" + string(uuid.NewUUID())
 
 	// leaderMigrator will be non-nil if and only if Leader Migration is enabled.
 	var leaderMigrator *leadermigration.LeaderMigrator = nil
 
 	// If leader migration is enabled, create the LeaderMigrator and prepare for migration
+	// 9. 如果启用了 `leader` 迁移，则创建 `LeaderMigrator` 并准备迁移
 	if leadermigration.Enabled(&c.ComponentConfig.Generic) {
 		logger.Info("starting leader migration")
 
@@ -283,12 +308,15 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	}
 
 	// Start the main lock
+	// 10. 获取 `leader` 锁
 	go leaderElectAndRun(ctx, c, id, electionChecker,
 		c.ComponentConfig.Generic.LeaderElection.ResourceLock,
 		c.ComponentConfig.Generic.LeaderElection.ResourceName,
 		leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
+				// 实例化各控制器初始化函数
 				controllerDescriptors := NewControllerDescriptors()
+				// 过滤需要迁移锁的控制器
 				if leaderMigrator != nil {
 					// If leader migration is enabled, we should start only non-migrated controllers
 					//  for the main lock.
@@ -296,6 +324,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 					logger.Info("leader migration: starting main controllers.")
 				}
 				controllerDescriptors[names.ServiceAccountTokenController] = saTokenControllerDescriptor
+				// 运行控制器
 				run(ctx, controllerDescriptors)
 			},
 			OnStoppedLeading: func() {
@@ -440,11 +469,13 @@ func (r *ControllerDescriptor) RequiresSpecialHandling() bool {
 }
 
 // KnownControllers returns all known controllers's name
+// 返回所有控制器名称
 func KnownControllers() []string {
 	return sets.StringKeySet(NewControllerDescriptors()).List()
 }
 
 // ControllerAliases returns a mapping of aliases to canonical controller names
+// 默认禁用的控制器
 func ControllerAliases() map[string]string {
 	aliases := map[string]string{}
 	for name, c := range NewControllerDescriptors() {
@@ -472,11 +503,14 @@ func ControllersDisabledByDefault() []string {
 // NewControllerDescriptors is a public map of named controller groups (you can start more than one in an init func)
 // paired to their ControllerDescriptor wrapper object that includes InitFunc.
 // This allows for structured downstream composition and subdivision.
+// 定义了各种controller的类型和其对于的启动函数
 func NewControllerDescriptors() map[string]*ControllerDescriptor {
 	controllers := map[string]*ControllerDescriptor{}
 	aliases := sets.NewString()
 
 	// All the controllers must fulfil common constraints, or else we will explode.
+	// 定义 register 函数
+	// 通过调用register函数来注册各个控制器的初始化函数。每个控制器都有一个唯一的名称，并且会检查是否有重复的名称。
 	register := func(controllerDesc *ControllerDescriptor) {
 		if controllerDesc == nil {
 			panic("received nil controller for a registration")
@@ -507,7 +541,8 @@ func NewControllerDescriptors() map[string]*ControllerDescriptor {
 	// app.ControllerDescriptor#RequiresSpecialHandling should return true for such controllers
 	// The only known special case is the ServiceAccountTokenController which *must* be started
 	// first to ensure that the SA tokens for future controllers will exist. Think very carefully before adding new
-	// special controllers.
+	// special controllers
+	// 注册各个控制器初始化函数，比如endpoint、deployment 、 replicaset、pv
 	register(newServiceAccountTokenControllerDescriptor(nil))
 
 	register(newEndpointsControllerDescriptor())
@@ -518,6 +553,9 @@ func NewControllerDescriptors() map[string]*ControllerDescriptor {
 	register(newResourceQuotaControllerDescriptor())
 	register(newNamespaceControllerDescriptor())
 	register(newServiceAccountControllerDescriptor())
+	// 垃圾回收器,其他控制器的删除操作只是配置`DeletionTimestamp` 字段,
+	// 并标记 orphan、background 或者 foreground 删除标签
+	// 真正删除操作是放在垃圾回收控制器
 	register(newGarbageCollectorControllerDescriptor())
 	register(newDaemonSetControllerDescriptor())
 	register(newJobControllerDescriptor())
@@ -541,11 +579,17 @@ func NewControllerDescriptors() map[string]*ControllerDescriptor {
 	register(newCloudNodeLifecycleControllerDescriptor()) // cloud provider controller
 	// TODO: persistent volume controllers into the IncludeCloudLoops only set as a cloud provider controller.
 
+	// in tree pv 控制器
 	register(newPersistentVolumeBinderControllerDescriptor())
+	// attachdetach控制器负责处理容器的挂载和卸载操作。
+	// 它使用CSI（Container Storage Interface）插件来管理持久卷的挂载和卸载。
 	register(newPersistentVolumeAttachDetachControllerDescriptor())
+	// out of tree pv 控制器
 	register(newPersistentVolumeExpanderControllerDescriptor())
 	register(newClusterRoleAggregrationControllerDescriptor())
+	// PVC保护控制器
 	register(newPersistentVolumeClaimProtectionControllerDescriptor())
+	// PV保护控制器
 	register(newPersistentVolumeProtectionControllerDescriptor())
 	register(newTTLAfterFinishedControllerDescriptor())
 	register(newRootCACertificatePublisherControllerDescriptor())
@@ -571,6 +615,7 @@ func NewControllerDescriptors() map[string]*ControllerDescriptor {
 // CreateControllerContext creates a context struct containing references to resources needed by the
 // controllers such as the cloud provider and clientBuilder. rootClientBuilder is only used for
 // the shared-informers client and token controller.
+// 构建了各种controller所需的资源的上下文，各种controller在启动时,入参为该context,具体参考initFn(ctx)。
 func CreateControllerContext(logger klog.Logger, s *config.CompletedConfig, rootClientBuilder, clientBuilder clientbuilder.ControllerClientBuilder, stop <-chan struct{}) (ControllerContext, error) {
 	// Informer transform to trim ManagedFields for memory efficiency.
 	trim := func(obj interface{}) (interface{}, error) {
@@ -581,6 +626,7 @@ func CreateControllerContext(logger klog.Logger, s *config.CompletedConfig, root
 	}
 
 	versionedClient := rootClientBuilder.ClientOrDie("shared-informers")
+	// 创建SharedInformerFactory
 	sharedInformers := informers.NewSharedInformerFactoryWithOptions(versionedClient, ResyncPeriod(s)(), informers.WithTransform(trim))
 
 	metadataClient := metadata.NewForConfigOrDie(rootClientBuilder.ConfigOrDie("metadata-informers"))
@@ -600,12 +646,14 @@ func CreateControllerContext(logger klog.Logger, s *config.CompletedConfig, root
 		restMapper.Reset()
 	}, 30*time.Second, stop)
 
+	// createCloudProvider 整合云提供商需要的东西，明确列出云提供商需要的东西作为参数
 	cloud, loopMode, err := createCloudProvider(logger, s.ComponentConfig.KubeCloudShared.CloudProvider.Name, s.ComponentConfig.KubeCloudShared.ExternalCloudVolumePlugin,
 		s.ComponentConfig.KubeCloudShared.CloudProvider.CloudConfigFile, s.ComponentConfig.KubeCloudShared.AllowUntaggedCloud, sharedInformers)
 	if err != nil {
 		return ControllerContext{}, err
 	}
 
+	// 初始化 ControllerContext 对象
 	ctx := ControllerContext{
 		ClientBuilder:                   clientBuilder,
 		InformerFactory:                 sharedInformers,
@@ -655,6 +703,7 @@ func StartControllers(ctx context.Context, controllerCtx ControllerContext, cont
 	//   so we cannot rely on it yet to add the name
 	// - it allows distinguishing between log entries emitted by the controller
 	//   and those emitted for it - this is a bit debatable and could be revised.
+	// 依次启动注册的控制器
 	for _, controllerDesc := range controllerDescriptors {
 		if controllerDesc.RequiresSpecialHandling() {
 			continue
@@ -682,6 +731,7 @@ func StartController(ctx context.Context, controllerCtx ControllerContext, contr
 	logger := klog.FromContext(ctx)
 	controllerName := controllerDescriptor.Name()
 
+	// 检测 `featureGate` 特性控制器是否启用
 	for _, featureGate := range controllerDescriptor.GetRequiredFeatureGates() {
 		if !utilfeature.DefaultFeatureGate.Enabled(featureGate) {
 			logger.Info("Controller is disabled by a feature gate", "controller", controllerName, "requiredFeatureGates", controllerDescriptor.GetRequiredFeatureGates())
@@ -689,11 +739,13 @@ func StartController(ctx context.Context, controllerCtx ControllerContext, contr
 		}
 	}
 
+	// 检测是否是云提供商控制器
 	if controllerDescriptor.IsCloudProviderController() && controllerCtx.LoopMode != IncludeCloudLoops {
 		logger.Info("Skipping a cloud provider controller", "controller", controllerName, "loopMode", controllerCtx.LoopMode)
 		return nil, nil
 	}
 
+	// 检查控制器是否启用
 	if !controllerCtx.IsControllerEnabled(controllerDescriptor) {
 		logger.Info("Warning: controller is disabled", "controller", controllerName)
 		return nil, nil
@@ -704,6 +756,7 @@ func StartController(ctx context.Context, controllerCtx ControllerContext, contr
 	logger.V(1).Info("Starting controller", "controller", controllerName)
 
 	initFunc := controllerDescriptor.GetInitFunc()
+	// 开始启动控制器
 	ctrl, started, err := initFunc(klog.NewContext(ctx, klog.LoggerWithName(logger, controllerName)), controllerCtx, controllerName)
 	if err != nil {
 		logger.Error(err, "Error starting controller", "controller", controllerName)

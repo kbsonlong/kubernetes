@@ -30,6 +30,7 @@ import (
 
 // rolloutRolling implements the logic for rolling a new replica set.
 func (dc *DeploymentController) rolloutRolling(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) error {
+	// 获取新旧RS
 	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
 	if err != nil {
 		return err
@@ -37,25 +38,30 @@ func (dc *DeploymentController) rolloutRolling(ctx context.Context, d *apps.Depl
 	allRSs := append(oldRSs, newRS)
 
 	// Scale up, if we can.
+	// 进行扩容
 	scaledUp, err := dc.reconcileNewReplicaSet(ctx, allRSs, newRS, d)
 	if err != nil {
 		return err
 	}
 	if scaledUp {
 		// Update DeploymentStatus
+		// 更新 Deployment 状态
 		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 	}
 
 	// Scale down, if we can.
+	// 开始缩容
 	scaledDown, err := dc.reconcileOldReplicaSets(ctx, allRSs, controller.FilterActiveReplicaSets(oldRSs), newRS, d)
 	if err != nil {
 		return err
 	}
 	if scaledDown {
 		// Update DeploymentStatus
+		// 更新 Deployment 状态
 		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 	}
 
+	// 如果滚动完毕, 需要清理
 	if deploymentutil.DeploymentComplete(d, &d.Status) {
 		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
 			return err
@@ -63,34 +69,41 @@ func (dc *DeploymentController) rolloutRolling(ctx context.Context, d *apps.Depl
 	}
 
 	// Sync deployment status
+	// 同步状态
 	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 }
 
 func (dc *DeploymentController) reconcileNewReplicaSet(ctx context.Context, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
+	// 新的 `rs` 副本数是否达到了预期, 也就是跟 `deployment` 定义的一致, 如果一致则没必要再进行滚动.
 	if *(newRS.Spec.Replicas) == *(deployment.Spec.Replicas) {
 		// Scaling not required.
 		return false, nil
 	}
+	// `newRS` 的副本数比 `deployment` 的预期多, 那么就需要缩容，减少副本数
 	if *(newRS.Spec.Replicas) > *(deployment.Spec.Replicas) {
 		// Scale down.
 		scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, *(deployment.Spec.Replicas), deployment)
 		return scaled, err
 	}
+	//  计算 `newRS` 的副本数
 	newReplicasCount, err := deploymentutil.NewRSNewReplicas(deployment, allRSs, newRS)
 	if err != nil {
 		return false, err
 	}
+	// 更新 `RS` 的注解和 `RS` 的 `rs.Spec.Replicas` 字段
 	scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, newReplicasCount, deployment)
 	return scaled, err
 }
 
 func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, allRSs []*apps.ReplicaSet, oldRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
 	logger := klog.FromContext(ctx)
+	// 计算 oldPodsCount
 	oldPodsCount := deploymentutil.GetReplicaCountForReplicaSets(oldRSs)
 	if oldPodsCount == 0 {
 		// Can't scale down further
 		return false, nil
 	}
+	// 计算 allPodsCount
 	allPodsCount := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
 	logger.V(4).Info("New replica set", "replicaSet", klog.KObj(newRS), "availableReplicas", newRS.Status.AvailableReplicas)
 	maxUnavailable := deploymentutil.MaxUnavailable(*deployment)
@@ -125,6 +138,7 @@ func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, all
 	// * The new replica set created must start with 0 replicas because allPodsCount is already at 13.
 	// * However, newRSPodsUnavailable would also be 0, so the 2 old replica sets could be scaled down by 5 (13 - 8 - 0), which would then
 	// allow the new replica set to be scaled up by 5.
+	// 计算 maxScaledDown
 	minAvailable := *(deployment.Spec.Replicas) - maxUnavailable
 	newRSUnavailablePodCount := *(newRS.Spec.Replicas) - newRS.Status.AvailableReplicas
 	maxScaledDown := allPodsCount - minAvailable - newRSUnavailablePodCount
@@ -134,6 +148,7 @@ func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, all
 
 	// Clean up unhealthy replicas first, otherwise unhealthy replicas will block deployment
 	// and cause timeout. See https://github.com/kubernetes/kubernetes/issues/16737
+	// 清理异常 RS
 	oldRSs, cleanupCount, err := dc.cleanupUnhealthyReplicas(ctx, oldRSs, deployment, maxScaledDown)
 	if err != nil {
 		return false, nil
@@ -142,6 +157,7 @@ func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, all
 
 	// Scale down old replica sets, need check maxUnavailable to ensure we can scale down
 	allRSs = append(oldRSs, newRS)
+	// 缩容旧的 RS
 	scaledDownCount, err := dc.scaleDownOldReplicaSetsForRollingUpdate(ctx, allRSs, oldRSs, deployment)
 	if err != nil {
 		return false, nil

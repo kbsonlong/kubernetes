@@ -86,6 +86,11 @@ func (est *EndpointSliceTracker) ShouldSync(endpointSlice *discovery.EndpointSli
 //  2. The tracker is expecting one or more of the provided EndpointSlices to be
 //     deleted. (EndpointSlices that have already been marked for deletion are ignored here.)
 //  3. The tracker is tracking EndpointSlices that have not been provided.
+//
+// 如果满足以下任一条件，StaleSlices 将返回 true：
+// 1. 所提供的一个或多个 EndpointSlice 的世代比对应的跟踪世代更老。
+// 2. 跟踪器期望删除一个或多个提供的 EndpointSlices。 （此处忽略已标记为删除的 EndpointSlice。）
+// 3. 跟踪器正在跟踪尚未提供的 EndpointSlice。
 func (est *EndpointSliceTracker) StaleSlices(service *v1.Service, endpointSlices []*discovery.EndpointSlice) bool {
 	est.lock.Lock()
 	defer est.lock.Unlock()
