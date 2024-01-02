@@ -269,6 +269,7 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 		Unchanged:   unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete),
 	}
 
+	// 根据`Service`的注解 `service.kubernetes.io/topology-mode` 判断是否开启拓扑路由切分
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
 		slicesToCreate, slicesToUpdate, events = r.topologyCache.AddHints(logger, si)
 	} else {
