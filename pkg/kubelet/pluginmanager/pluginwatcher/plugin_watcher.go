@@ -63,10 +63,12 @@ func (w *Watcher) Start(stopCh <-chan struct{}) error {
 	w.fsWatcher = fsWatcher
 
 	// Traverse plugin dir and add filesystem watchers before starting the plugin processing goroutine.
+	// watch socket dir
 	if err := w.traversePluginDir(w.path); err != nil {
 		klog.ErrorS(err, "Failed to traverse plugin socket path", "path", w.path)
 	}
 
+	// 启动一个goroutine去watch socket dir中，socket文件的增加和删除
 	go func(fsWatcher *fsnotify.Watcher) {
 		for {
 			select {
