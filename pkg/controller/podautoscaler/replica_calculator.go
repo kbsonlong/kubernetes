@@ -82,9 +82,15 @@ func (c *ReplicaCalculator) GetResourceReplicas(ctx context.Context, currentRepl
 		return 0, 0, 0, time.Time{}, fmt.Errorf("did not receive metrics for targeted pods (pods might be unready)")
 	}
 
-	requests, err := calculatePodRequests(podList, container, resource)
+	requests, ignoredByRequest, err := calculatePodRequests(podList, container, resource)
 	if err != nil {
 		return 0, 0, 0, time.Time{}, err
+	}
+	if len(ignoredByRequest) > 0 {
+		for _, podName := range ignoredByRequest {
+			ignoredPods.Insert(podName)
+		}
+		removeMetricsForPods(metrics, sets.NewString(ignoredByRequest...))
 	}
 
 	usageRatio, utilization, rawUtilization, err := metricsclient.GetResourceUtilizationRatio(metrics, requests, targetUtilization)
@@ -421,10 +427,12 @@ func groupPods(pods []*v1.Pod, metrics metricsclient.PodMetricsInfo, resource v1
 	return
 }
 
-func calculatePodRequests(pods []*v1.Pod, container string, resource v1.ResourceName) (map[string]int64, error) {
+func calculatePodRequests(pods []*v1.Pod, container string, resource v1.ResourceName) (map[string]int64, []string, error) {
 	requests := make(map[string]int64, len(pods))
+	ignored := make([]string, 0)
 	for _, pod := range pods {
 		podSum := int64(0)
+		missing := false
 		// Calculate all regular containers and restartable init containers requests.
 		containers := append([]v1.Container{}, pod.Spec.Containers...)
 		for _, c := range pod.Spec.InitContainers {
@@ -437,13 +445,18 @@ func calculatePodRequests(pods []*v1.Pod, container string, resource v1.Resource
 				if containerRequest, ok := c.Resources.Requests[resource]; ok {
 					podSum += containerRequest.MilliValue()
 				} else {
-					return nil, fmt.Errorf("missing request for %s in container %s of Pod %s", resource, c.Name, pod.ObjectMeta.Name)
+					fmt.Errorf("missing request for %s in container %s of Pod %s", resource, c.Name, pod.ObjectMeta.Name)
+					missing = true
 				}
 			}
 		}
+		if missing {
+			ignored = append(ignored, pod.Name)
+			continue
+		}
 		requests[pod.Name] = podSum
 	}
-	return requests, nil
+	return requests, ignored, nil
 }
 
 func removeMetricsForPods(metrics metricsclient.PodMetricsInfo, pods sets.String) {
